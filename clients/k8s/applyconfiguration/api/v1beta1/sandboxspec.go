@@ -39,6 +39,8 @@ type SandboxSpecApplyConfiguration struct {
 	// - Suspended: the controller terminates the backing Pod but retains the
 	// Sandbox object and its volumes so it can later be resumed. Resuming creates a new
 	// Pod from the current podTemplate that reattaches the retained volumes.
+	// - Hibernated: the opt-in checkpoint provider captures the backing Pod
+	// before the controller removes it. Resuming restores its execution state.
 	// This field declares intent only. The observed readiness of the Sandbox is
 	// reported by the Ready condition, and the progress of a suspension by the
 	// Suspended condition; a Sandbox in Running mode is not Ready until its Pod is

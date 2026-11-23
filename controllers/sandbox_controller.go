@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -320,11 +321,14 @@ type SandboxReconciler struct {
 	// cache. Used only to confirm that a Sandbox still exists and is not being
 	// deleted before it adopts an unowned child. Falls back to Client when
 	// unset (e.g. in unit tests with a fake client).
-	APIReader     client.Reader
-	Scheme        *runtime.Scheme
-	Recorder      events.EventRecorder
-	Tracer        asmetrics.Instrumenter
-	ClusterDomain string
+	APIReader                   client.Reader
+	Scheme                      *runtime.Scheme
+	Recorder                    events.EventRecorder
+	Tracer                      asmetrics.Instrumenter
+	ClusterDomain               string
+	DynamicClient               dynamic.Interface
+	EnablePodCheckpointRestore  bool
+	PodCheckpointRuntimeClasses map[string]struct{}
 
 	// suspendStartTimes and resumeStartTimes self-time in-flight suspend and
 	// resume transitions per Sandbox key (NamespacedName), guarded by UID.
@@ -374,6 +378,7 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/finalizers,verbs=get;update;patch
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=checkpoint.k8s.io,resources=podcheckpoints,verbs=get;list;watch;create;delete;patch;restore
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
@@ -416,7 +421,8 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	ctx, end := r.Tracer.StartSpan(ctx, sandbox, "ReconcileSandbox", initialAttrs)
 	defer end()
 
-	// If the sandbox is being deleted, do nothing
+	// PodCheckpoint data is external to the Sandbox API object and must be
+	// removed before the Sandbox finalizer is released.
 	if !sandbox.DeletionTimestamp.IsZero() {
 		logger.Info("Sandbox is being deleted")
 		r.suspendStartTimes.Delete(req.NamespacedName)
@@ -424,6 +430,23 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		r.deferralClock.clear(req.NamespacedName)
 		r.recreateBackoff.clear(req.NamespacedName)
 		r.forgetSandboxCreationMetrics(sandbox.UID)
+		if slices.Contains(sandbox.Finalizers, checkpointRestoreFinalizer) {
+			pending, err := r.deleteCheckpointSandboxPods(ctx, sandbox)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if pending {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			pending, err = r.deleteOwnedPodCheckpoints(ctx, sandbox)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if pending {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return ctrl.Result{}, r.removeCheckpointRestoreFinalizer(ctx, sandbox)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -484,6 +507,11 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		recreateRequeue, err = r.reconcileChildResources(ctx, sandbox, wd)
 		expiredAfterReconcile, requeueAfter := checkSandboxExpiry(sandbox, time.Now())
 		result.RequeueAfter = requeueAfter
+		if (sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated ||
+			(sandbox.Status.CheckpointRestore != nil && !meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionRestoreReady)))) &&
+			(result.RequeueAfter == 0 || result.RequeueAfter > 2*time.Second) {
+			result.RequeueAfter = 2 * time.Second
+		}
 		if expiredAfterReconcile {
 			r.recreateBackoff.clear(req.NamespacedName)
 			setSandboxExpiredCondition(sandbox)
@@ -769,6 +797,15 @@ func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbo
 			readyCondition.Message = "Sandbox is suspending"
 		} else {
 			readyCondition.Message = "Sandbox is suspended"
+		}
+		return readyCondition
+	}
+	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated {
+		readyCondition.Reason = "SandboxHibernated"
+		if meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionHibernated)) {
+			readyCondition.Message = "Sandbox is hibernated"
+		} else {
+			readyCondition.Message = "Sandbox is hibernating"
 		}
 		return readyCondition
 	}
@@ -1750,7 +1787,7 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			logger.Error(err, "Failed to get Pod")
 			return nil, 0, fmt.Errorf("pod get failed: %w", err)
 		}
-		if podNameAnnotationExists {
+		if podNameAnnotationExists && sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeHibernated && sandbox.Status.CheckpointRestore == nil {
 			logger.Info("Pod referenced by annotation not found, clearing annotation to recover state", "podName", podName)
 			if err := r.clearPodNameAnnotation(ctx, sandbox); err != nil {
 				return nil, 0, err
@@ -1781,6 +1818,20 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			}
 		}
 		pod = ownedPods[0].DeepCopy()
+	}
+
+	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated || sandbox.Status.CheckpointRestore != nil ||
+		slices.Contains(sandbox.Finalizers, checkpointRestoreFinalizer) {
+		if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated {
+			if err := ensureCheckpointRestoreFinalizer(ctx, r.Client, sandbox); err != nil {
+				return pod, 0, fmt.Errorf("ensure checkpoint/restore finalizer: %w", err)
+			}
+		}
+		handled, resultPod, err := r.reconcilePodCheckpointRestore(ctx, sandbox, pod)
+		if handled || err != nil {
+			return resultPod, 0, err
+		}
+		pod = resultPod
 	}
 
 	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
@@ -2491,12 +2542,19 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}, builder.WithPredicates(r.sandboxCreationMetricsPredicate())).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
-		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
-		Complete(r)
+		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers})
+	if r.EnablePodCheckpointRestore {
+		checkpoint := kataCheckpointObject()
+		if _, err := mgr.GetRESTMapper().RESTMapping(checkpoint.GroupVersionKind().GroupKind(), podCheckpointGVR.Version); err != nil {
+			return fmt.Errorf("discover PodCheckpoint API for enabled Kata checkpoint/restore: %w", err)
+		}
+		controllerBuilder.Owns(checkpoint, builder.WithPredicates(labelSelectorPredicate))
+	}
+	return controllerBuilder.Complete(r)
 }
 
 // In-memory exponential backoff for failedPodPolicy=Recreate.

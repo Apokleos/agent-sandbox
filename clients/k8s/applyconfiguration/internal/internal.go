@@ -2499,6 +2499,39 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxStatus
       default: {}
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCheckpointRestoreStatus
+  map:
+    fields:
+    - name: checkpointName
+      type:
+        scalar: string
+    - name: checkpointUID
+      type:
+        scalar: string
+    - name: operationID
+      type:
+        scalar: string
+    - name: restoreGeneration
+      type:
+        scalar: numeric
+    - name: restoreStartTime
+      type:
+        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
+    - name: restoredPodUID
+      type:
+        scalar: string
+    - name: sourceNodeName
+      type:
+        scalar: string
+    - name: sourcePodName
+      type:
+        scalar: string
+    - name: sourcePodUID
+      type:
+        scalar: string
+    - name: startedAt
+      type:
+        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSpec
   map:
     fields:
@@ -2530,6 +2563,9 @@ var schemaYAML = typed.YAMLObject(`types:
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxStatus
   map:
     fields:
+    - name: checkpointRestore
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCheckpointRestoreStatus
     - name: conditions
       type:
         list:

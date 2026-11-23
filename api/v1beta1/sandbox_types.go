@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // ConditionType is a type of condition for a resource.
@@ -155,6 +156,15 @@ const (
 	// Teardown of its underlying resources may still be pending (see Lifecycle).
 	SandboxReasonExpired = "SandboxExpired"
 
+	// SandboxConditionCheckpointReady indicates that a checkpoint is ready to restore.
+	SandboxConditionCheckpointReady ConditionType = "CheckpointReady"
+	// SandboxConditionHibernated indicates that checkpointing completed and the source Pod is absent.
+	SandboxConditionHibernated ConditionType = "Hibernated"
+	// SandboxConditionRestoreReady indicates that the replacement Pod restored from the checkpoint is Ready.
+	SandboxConditionRestoreReady ConditionType = "RestoreReady"
+	// SandboxConditionCheckpointRestoreSupported indicates whether this Sandbox is eligible for Pod-level checkpoint/restore.
+	SandboxConditionCheckpointRestoreSupported ConditionType = "CheckpointRestoreSupported"
+
 	// SandboxPodNameAnnotation is the annotation used to track the pod name adopted from a warm pool.
 	// Deprecated: New Sandboxes use their own name for the backing pod while non-empty legacy annotations may still be honored.
 	SandboxPodNameAnnotation = "agents.x-k8s.io/pod-name"
@@ -249,9 +259,9 @@ type PersistentVolumeClaimTemplate struct {
 }
 
 // SandboxOperatingMode defines the desired operational state of the Sandbox.
-// +kubebuilder:validation:Enum=Running;Suspended
+// +kubebuilder:validation:Enum=Running;Suspended;Hibernated
 //
-// It expresses intent ("running" vs. "suspended"), not observed status; whether the
+// It expresses intent, not observed status; whether the
 // Sandbox has actually reached that state is reported by conditions (see
 // SandboxConditionReady and SandboxConditionSuspended).
 type SandboxOperatingMode string
@@ -268,6 +278,8 @@ const (
 	// volumes. Progress of the suspension is reported by the Suspended condition (see
 	// SandboxConditionSuspended).
 	SandboxOperatingModeSuspended SandboxOperatingMode = "Suspended"
+	// SandboxOperatingModeHibernated indicates the sandbox should be checkpointed and its backing Pod removed.
+	SandboxOperatingModeHibernated SandboxOperatingMode = "Hibernated"
 )
 
 // FailedPodPolicy controls behavior when the backing Pod reaches phase Failed.
@@ -370,6 +382,8 @@ type SandboxSpec struct {
 	//   - Suspended: the controller terminates the backing Pod but retains the
 	//     Sandbox object and its volumes so it can later be resumed. Resuming creates a new
 	//     Pod from the current podTemplate that reattaches the retained volumes.
+	//   - Hibernated: the opt-in checkpoint provider captures the backing Pod
+	//     before the controller removes it. Resuming restores its execution state.
 	// This field declares intent only. The observed readiness of the Sandbox is
 	// reported by the Ready condition, and the progress of a suspension by the
 	// Suspended condition; a Sandbox in Running mode is not Ready until its Pod is
@@ -378,6 +392,51 @@ type SandboxSpec struct {
 	// +kubebuilder:default=Running
 	// +optional
 	OperatingMode SandboxOperatingMode `json:"operatingMode,omitempty"`
+}
+
+// SandboxCheckpointRestoreStatus records the durable identity of the current
+// Pod-level checkpoint/restore cycle. The workflow state itself is exposed by
+// standard status conditions.
+type SandboxCheckpointRestoreStatus struct {
+	// checkpointName is the PodCheckpoint used by the current cycle.
+	// +optional
+	CheckpointName string `json:"checkpointName,omitempty"`
+
+	// checkpointUID identifies the exact API object bound to this cycle.
+	// +optional
+	CheckpointUID types.UID `json:"checkpointUID,omitempty"`
+
+	// restoreGeneration identifies the user intent that started this restore attempt.
+	// +optional
+	RestoreGeneration int64 `json:"restoreGeneration,omitempty"`
+
+	// restoreStartTime is when the current restore attempt was recorded.
+	// +optional
+	RestoreStartTime *metav1.Time `json:"restoreStartTime,omitempty"`
+
+	// sourcePodName is the name of the Pod captured by the checkpoint.
+	// +optional
+	SourcePodName string `json:"sourcePodName,omitempty"`
+
+	// sourcePodUID pins the checkpoint to one Pod instance.
+	// +optional
+	SourcePodUID types.UID `json:"sourcePodUID,omitempty"`
+
+	// sourceNodeName records the node holding the alpha node-local checkpoint.
+	// +optional
+	SourceNodeName string `json:"sourceNodeName,omitempty"`
+
+	// operationID is a deterministic identifier for this checkpoint cycle.
+	// +optional
+	OperationID string `json:"operationID,omitempty"`
+
+	// restoredPodUID identifies the replacement Pod after a successful restore.
+	// +optional
+	RestoredPodUID types.UID `json:"restoredPodUID,omitempty"`
+
+	// startedAt is when this checkpoint cycle was first created.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 }
 
 // ShutdownPolicy describes the policy for deleting the Sandbox when it expires.
@@ -450,6 +509,11 @@ type SandboxStatus struct {
 	// Like podIPs, it is cleared whenever the pod is absent (e.g. while suspended).
 	// +optional
 	NodeName string `json:"nodeName,omitempty"`
+
+	// checkpointRestore records durable Pod checkpoint/restore cycle identity.
+	// Workflow progress is represented by status conditions.
+	// +optional
+	CheckpointRestore *SandboxCheckpointRestoreStatus `json:"checkpointRestore,omitempty"`
 }
 
 // +genclient
