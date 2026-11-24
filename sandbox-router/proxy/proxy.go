@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/net/http/httpguts"
 	"google.golang.org/grpc/codes"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/agent-sandbox/internal/activity"
 
 	"sigs.k8s.io/agent-sandbox/sandbox-router/authz"
 	"sigs.k8s.io/agent-sandbox/sandbox-router/config"
@@ -41,16 +44,22 @@ import (
 // HTTP request is parsed into a Target and proxied to the upstream sandbox
 // with the same body, headers (minus Host), and method.
 type Handler struct {
-	cfg             *config.Config
-	metrics         *observability.Metrics
-	propagator      propagation.TextMapPropagator
-	transport       http.RoundTripper
-	httpTransport   *http.Transport
-	grpcTransport   *http.Transport
-	grpcConnections *grpcConnections
-	cache           Lookup
-	authz           authz.Authorizer
-	log             logr.Logger
+	cfg                   *config.Config
+	metrics               *observability.Metrics
+	propagator            propagation.TextMapPropagator
+	transport             http.RoundTripper
+	httpTransport         *http.Transport
+	grpcTransport         *http.Transport
+	grpcConnections       *grpcConnections
+	directTransport       http.RoundTripper
+	directHTTPTransport   *http.Transport
+	directGRPCTransport   http.RoundTripper
+	directGRPCRaw         *http.Transport
+	directGRPCConnections *grpcConnections
+	activity              ActivityAdmission
+	cache                 Lookup
+	authz                 authz.Authorizer
+	log                   logr.Logger
 }
 
 // Options bundles the dependencies NewHandler needs. Metrics, Propagator,
@@ -58,6 +67,8 @@ type Handler struct {
 // no metrics, a no-op propagator, DNS-only resolution, and AllowAll
 // authorization respectively, which is convenient for tests.
 type Options struct {
+	// Activity guards opt-in requests with durable Kubernetes admission tickets.
+	Activity   ActivityAdmission
 	Config     *config.Config
 	Metrics    *observability.Metrics
 	Propagator propagation.TextMapPropagator
@@ -70,6 +81,17 @@ type Options struct {
 	// a TokenReview authorizer to enforce per-sandbox auth (KEP-NNNN).
 	Authorizer authz.Authorizer
 	Logger     logr.Logger
+}
+
+// ActivityAdmission allows protocol tests without requiring a running API server.
+type ActivityAdmission interface {
+	Acquire(context.Context, string, string, string) (*activity.Permit, error)
+}
+
+// BoundActivityAdmission pins admission to the Sandbox identity that was
+// authorized, preventing a stale cache entry from waking a new incarnation.
+type BoundActivityAdmission interface {
+	AcquireForSandbox(context.Context, string, string, string, types.UID) (*activity.Permit, error)
 }
 
 // NewHandler builds a Handler from o.
@@ -115,17 +137,37 @@ func NewHandler(o Options) *Handler {
 	grpcTr := grpcTransport(o.Config)
 	grpcConns := newGRPCConnections(grpcTr.DialContext)
 	grpcTr.DialContext = grpcConns.dialContext
+	// net/http.Transport can replay idempotent requests on a reused connection.
+	// Fresh connections keep opt-in forwarding single-attempt at both layers.
+	direct := defaultTransport(o.Config)
+	direct.DisableKeepAlives = true
+	directGRPC := grpcTransport(o.Config)
+	directGRPC.DisableKeepAlives = true
+	directGRPCConns := newGRPCConnections(directGRPC.DialContext)
+	directGRPC.DialContext = directGRPCConns.dialContext
+	var directHTTPRT http.RoundTripper = direct
+	var directGRPCRT http.RoundTripper = directGRPC
+	if o.Metrics != nil {
+		directHTTPRT = newMetricsTransport(directHTTPRT, o.Metrics)
+		directGRPCRT = newMetricsTransport(directGRPCRT, o.Metrics)
+	}
 	return &Handler{
-		cfg:             o.Config,
-		metrics:         o.Metrics,
-		propagator:      o.Propagator,
-		transport:       tr,
-		httpTransport:   httpTransport,
-		grpcTransport:   grpcTr,
-		grpcConnections: grpcConns,
-		cache:           o.Cache,
-		authz:           authorizer,
-		log:             o.Logger,
+		cfg:                   o.Config,
+		metrics:               o.Metrics,
+		propagator:            o.Propagator,
+		transport:             tr,
+		httpTransport:         httpTransport,
+		grpcTransport:         grpcTr,
+		grpcConnections:       grpcConns,
+		directTransport:       directHTTPRT,
+		directHTTPTransport:   direct,
+		directGRPCTransport:   directGRPCRT,
+		directGRPCRaw:         directGRPC,
+		directGRPCConnections: directGRPCConns,
+		activity:              o.Activity,
+		cache:                 o.Cache,
+		authz:                 authorizer,
+		log:                   o.Logger,
 	}
 }
 
@@ -134,6 +176,8 @@ func NewHandler(o Options) *Handler {
 func (h *Handler) CloseIdleConnections() {
 	h.httpTransport.CloseIdleConnections()
 	h.grpcTransport.CloseIdleConnections()
+	h.directHTTPTransport.CloseIdleConnections()
+	h.directGRPCRaw.CloseIdleConnections()
 }
 
 // Close releases upstream resources after server shutdown. It also closes
@@ -141,6 +185,7 @@ func (h *Handler) CloseIdleConnections() {
 // waiting for request handlers. The handler cannot be reused after Close.
 func (h *Handler) Close() {
 	h.grpcConnections.close()
+	h.directGRPCConnections.close()
 	h.CloseIdleConnections()
 }
 
@@ -337,6 +382,66 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upstreamURL.RawPath = r.URL.EscapedPath()
 	}
 	upstreamURL.RawQuery = outboundRawQuery
+	transport := h.transport
+	admitted := false
+	if h.activity != nil {
+		var permit *activity.Permit
+		var err error
+		if bound, ok := h.activity.(BoundActivityAdmission); ok {
+			permit, err = bound.AcquireForSandbox(r.Context(), target.Namespace, target.ID, activity.Request, resolved.SandboxUID)
+		} else {
+			permit, err = h.activity.Acquire(r.Context(), target.Namespace, target.ID, activity.Request)
+		}
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, activity.ErrCapacity) {
+				status = http.StatusTooManyRequests
+			}
+			if errors.Is(err, activity.ErrManualMode) {
+				status = http.StatusConflict
+			}
+			if errors.Is(err, activity.ErrSandboxReplaced) {
+				status = http.StatusForbidden
+			}
+			writeProxyError(w, r, kind, &Error{Status: status, Detail: err.Error()})
+			return
+		}
+		if permit != nil {
+			defer func() {
+				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := permit.Release(cleanup); err != nil {
+					h.log.Error(err, "activity completion was not recorded; ticket remains protected")
+				}
+			}()
+			if permit.SandboxUID == "" {
+				writeProxyError(w, r, kind, &Error{Status: http.StatusServiceUnavailable, Detail: "activity permit lacks a Sandbox identity"})
+				return
+			}
+			// Admission may wait through a Pod replacement. Re-authorize the
+			// fresh Sandbox identity before using the admitted endpoint.
+			if authorizationTarget.SandboxUID != string(permit.SandboxUID) {
+				freshTarget := authorizationTarget
+				freshTarget.SandboxUID = string(permit.SandboxUID)
+				if err := h.authz.Authorize(r.Context(), r, freshTarget); err != nil {
+					if h.metrics != nil {
+						h.metrics.AuthzDecisionsTotal.WithLabelValues(target.Namespace, "deny").Inc()
+					}
+					writeProxyError(w, r, kind, &Error{Status: authz.HTTPStatusFor(err), Detail: err.Error()})
+					return
+				}
+			}
+			target.PodIP = permit.PodIP
+			target.UID = string(permit.SandboxUID)
+			target0 = target
+			// Keep main's escaped path, stripped credential query and prefix
+			// handling. Only the destination address comes from admission.
+			upstreamURL.Host = net.JoinHostPort(permit.PodIP, strconv.Itoa(target.Port))
+			src = SourcePodIP
+			transport = h.directTransport
+			admitted = true
+		}
+	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL = upstreamURL
@@ -418,7 +523,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// sees a continuation of the inbound trace.
 			h.propagator.Inject(pr.Out.Context(), propagation.HeaderCarrier(pr.Out.Header))
 		},
-		Transport:     h.transport,
+		Transport:     transport,
 		FlushInterval: -1, // immediate flush for SSE / streaming responses
 		ErrorHandler: func(w http.ResponseWriter, errReq *http.Request, err error) {
 			var bodyLimit *http.MaxBytesError
@@ -483,6 +588,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if grpcRequest {
 		rp.Transport = h.grpcTransport
+		if admitted {
+			rp.Transport = h.directGRPCTransport
+		}
 		rp.ModifyResponse = prepareGRPCResponse
 		if kind == protoGRPCWeb {
 			// The inbound request context carries the observability

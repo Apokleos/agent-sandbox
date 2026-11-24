@@ -35,12 +35,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"sigs.k8s.io/agent-sandbox/internal/activity"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/version"
 	"sigs.k8s.io/agent-sandbox/sandbox-router/authz"
@@ -206,7 +208,7 @@ func run(ctx context.Context, cfg *config.Config, log logr.Logger) (err error) {
 	// Build once if either feature needs it so we don't load kubeconfig
 	// twice. Nil when neither feature is on; helpers below handle that.
 	var k8sClient kubernetes.Interface
-	if cfg.CacheEnabled || cfg.AuthzMode == config.AuthzTokenReview {
+	if cfg.CacheEnabled || cfg.AuthzMode == config.AuthzTokenReview || cfg.EnableAutoSuspension {
 		c, err := buildKubernetesClient(cfg.Kubeconfig)
 		if err != nil {
 			return fmt.Errorf("kubernetes client: %w", err)
@@ -318,6 +320,30 @@ func run(ctx context.Context, cfg *config.Config, log logr.Logger) (err error) {
 		Propagator: otel.GetTextMapPropagator(),
 		Logger:     log.WithName("proxy"),
 		Authorizer: authorizer,
+	}
+	if cfg.EnableAutoSuspension {
+		clientConfig, err := loadRESTConfig(cfg.Kubeconfig)
+		if err != nil {
+			return fmt.Errorf("activity Kubernetes config: %w", err)
+		}
+		dynamicClient, err := dynamic.NewForConfig(clientConfig)
+		if err != nil {
+			return fmt.Errorf("activity Kubernetes client: %w", err)
+		}
+		apiRequests := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sandbox_router_activity_api_requests_total",
+			Help: "Kubernetes API requests made by durable activity admission, including readiness polling and ticket completion.",
+		}, []string{"operation", "result"})
+		reg.MustRegister(apiRequests)
+		proxyOpts.Activity = activity.New(dynamicClient, k8sClient, activity.Options{
+			ObserveAPICall: func(operation string, err error) {
+				result := "success"
+				if err != nil {
+					result = "error"
+				}
+				apiRequests.WithLabelValues(operation, result).Inc()
+			},
+		})
 	}
 	if podCache != nil {
 		proxyOpts.Cache = podCache

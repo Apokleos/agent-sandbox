@@ -47,6 +47,8 @@ type SandboxSpecApplyConfiguration struct {
 	// actually up (see SandboxConditionReady).
 	// Defaults to Running if not specified.
 	OperatingMode *apiv1beta1.SandboxOperatingMode `json:"operatingMode,omitempty"`
+	// autoSuspension enables traffic-coordinated Kata hibernation; absent is disabled.
+	AutoSuspension *SandboxAutoSuspensionSpecApplyConfiguration `json:"autoSuspension,omitempty"`
 }
 
 // SandboxSpecApplyConfiguration constructs a declarative configuration of the SandboxSpec type for use with
@@ -113,5 +115,13 @@ func (b *SandboxSpecApplyConfiguration) WithShutdownPolicy(value apiv1beta1.Shut
 // If called multiple times, the OperatingMode field is set to the value of the last call.
 func (b *SandboxSpecApplyConfiguration) WithOperatingMode(value apiv1beta1.SandboxOperatingMode) *SandboxSpecApplyConfiguration {
 	b.OperatingMode = &value
+	return b
+}
+
+// WithAutoSuspension sets the AutoSuspension field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AutoSuspension field is set to the value of the last call.
+func (b *SandboxSpecApplyConfiguration) WithAutoSuspension(value *SandboxAutoSuspensionSpecApplyConfiguration) *SandboxSpecApplyConfiguration {
+	b.AutoSuspension = value
 	return b
 }

@@ -38,6 +38,26 @@ spec:
             type: object
           spec:
             properties:
+              autoSuspension:
+                properties:
+                  activityMode:
+                    enum:
+                    - RoutedRequestsAndLeases
+                    type: string
+                  idleTimeoutSeconds:
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxCycles:
+                    format: int32
+                    maximum: 10
+                    minimum: 1
+                    type: integer
+                required:
+                - activityMode
+                - idleTimeoutSeconds
+                - maxCycles
+                type: object
               failedPodPolicy:
                 default: Retain
                 enum:
@@ -4107,8 +4127,41 @@ spec:
               rule: has(self.volumeClaimTemplates) == has(oldSelf.volumeClaimTemplates)
                 && (!has(self.volumeClaimTemplates) || self.volumeClaimTemplates ==
                 oldSelf.volumeClaimTemplates)
+            - message: autoSuspension must be enabled when the Sandbox is created;
+                recreate the Sandbox to enable it
+              rule: '!has(self.autoSuspension) || has(oldSelf.autoSuspension)'
           status:
             properties:
+              autoSuspension:
+                properties:
+                  cycles:
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  epoch:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  gate:
+                    enum:
+                    - Open
+                    - Draining
+                    - Checkpointing
+                    - Hibernated
+                    - Restoring
+                    type: string
+                  lastActivityTime:
+                    format: date-time
+                    type: string
+                  manualCheckpoint:
+                    enum:
+                    - Requested
+                    type: string
+                required:
+                - cycles
+                - epoch
+                - gate
+                type: object
               checkpointRestore:
                 properties:
                   checkpointName:

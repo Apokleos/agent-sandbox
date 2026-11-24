@@ -42,6 +42,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1beta1.PodTemplateApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("Sandbox"):
 		return &apiv1beta1.SandboxApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxAutoSuspensionSpec"):
+		return &apiv1beta1.SandboxAutoSuspensionSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxAutoSuspensionStatus"):
+		return &apiv1beta1.SandboxAutoSuspensionStatusApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("SandboxBlueprint"):
 		return &apiv1beta1.SandboxBlueprintApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("SandboxCheckpointRestoreStatus"):

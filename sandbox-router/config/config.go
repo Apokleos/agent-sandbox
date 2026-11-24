@@ -86,6 +86,8 @@ const (
 // Config is the parsed runtime configuration. All fields are populated by
 // RegisterFlags + flag.Parse and validated by Validate.
 type Config struct {
+	// EnableAutoSuspension enables durable activity admission for opt-in Sandboxes.
+	EnableAutoSuspension bool
 	// HTTPAddr is the address for the plain-HTTP proxy listener. Empty disables
 	// plain HTTP.
 	HTTPAddr string
@@ -391,6 +393,9 @@ func Defaults() Config {
 // Validate checks that the resolved configuration is internally consistent.
 // It returns the first error encountered.
 func (c *Config) Validate() error {
+	if c.EnableAutoSuspension && c.AuthzMode != AuthzScopedToken {
+		return fmt.Errorf("--enable-auto-suspension requires --authz-mode=scoped-token for per-Sandbox authorization")
+	}
 	if c.HTTPAddr == "" && c.HTTPSAddr == "" {
 		return errors.New("at least one of --http-bind-address or --https-bind-address must be set")
 	}

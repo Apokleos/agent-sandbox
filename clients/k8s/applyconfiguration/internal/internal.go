@@ -2499,6 +2499,42 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxStatus
       default: {}
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxAutoSuspensionSpec
+  map:
+    fields:
+    - name: activityMode
+      type:
+        scalar: string
+      default: ""
+    - name: idleTimeoutSeconds
+      type:
+        scalar: numeric
+      default: 0
+    - name: maxCycles
+      type:
+        scalar: numeric
+      default: 0
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxAutoSuspensionStatus
+  map:
+    fields:
+    - name: cycles
+      type:
+        scalar: numeric
+      default: 0
+    - name: epoch
+      type:
+        scalar: numeric
+      default: 0
+    - name: gate
+      type:
+        scalar: string
+      default: ""
+    - name: lastActivityTime
+      type:
+        namedType: Time.v1.meta.apis.pkg.apimachinery.k8s.io
+    - name: manualCheckpoint
+      type:
+        scalar: string
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCheckpointRestoreStatus
   map:
     fields:
@@ -2535,6 +2571,9 @@ var schemaYAML = typed.YAMLObject(`types:
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSpec
   map:
     fields:
+    - name: autoSuspension
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxAutoSuspensionSpec
     - name: failedPodPolicy
       type:
         scalar: string
@@ -2563,6 +2602,9 @@ var schemaYAML = typed.YAMLObject(`types:
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxStatus
   map:
     fields:
+    - name: autoSuspension
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxAutoSuspensionStatus
     - name: checkpointRestore
       type:
         namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCheckpointRestoreStatus

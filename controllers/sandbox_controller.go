@@ -383,7 +383,7 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -408,6 +408,13 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Automatic admission barriers must never be evaluated from stale cache data.
+	if hasAutoSuspension(sandbox) && r.APIReader != nil {
+		if err := r.APIReader.Get(ctx, req.NamespacedName, sandbox); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
 	}
 
 	// Start Tracing Span
@@ -491,6 +498,21 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Info("Sandbox has expired, deleting child resources and checking shutdown policy")
 		sandboxDeleted, err = r.handleSandboxExpiry(ctx, sandbox)
 	} else {
+		barrier, autoErr := r.reconcileAutoSuspension(ctx, sandbox, time.Now())
+		if autoErr != nil {
+			return ctrl.Result{}, autoErr
+		}
+		if barrier {
+			return ctrl.Result{RequeueAfter: autoPollInterval}, nil
+		}
+		// Completion accounting may commit status and still permit child
+		// reconciliation. Anchor the next patch to that committed response,
+		// while preserving the optimistic fence against later metadata writes.
+		if sandbox.ResourceVersion != oldResourceVersion {
+			oldStatus = sandbox.Status.DeepCopy()
+			oldResourceVersion = sandbox.ResourceVersion
+		}
+
 		// Per-pass deferral view for the recoverable pod metadata patch
 		// (--sandbox-write-behind-window > 0). The pod patch bound caps the
 		// deferral: the safe-to-evict strip must land within
@@ -507,11 +529,15 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		recreateRequeue, err = r.reconcileChildResources(ctx, sandbox, wd)
 		expiredAfterReconcile, requeueAfter := checkSandboxExpiry(sandbox, time.Now())
 		result.RequeueAfter = requeueAfter
-		if (sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated ||
+		if !checkpointRestoreUnsupported(sandbox) && (effectiveOperatingMode(sandbox) == sandboxv1beta1.SandboxOperatingModeHibernated ||
 			(sandbox.Status.CheckpointRestore != nil && !meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionRestoreReady)))) &&
 			(result.RequeueAfter == 0 || result.RequeueAfter > 2*time.Second) {
 			result.RequeueAfter = 2 * time.Second
 		}
+		if hasAutoSuspension(sandbox) && !checkpointRestoreUnsupported(sandbox) && (result.RequeueAfter == 0 || result.RequeueAfter > autoPollInterval) {
+			result.RequeueAfter = autoPollInterval
+		}
+
 		if expiredAfterReconcile {
 			r.recreateBackoff.clear(req.NamespacedName)
 			setSandboxExpiredCondition(sandbox)
@@ -800,7 +826,7 @@ func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbo
 		}
 		return readyCondition
 	}
-	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated {
+	if effectiveOperatingMode(sandbox) == sandboxv1beta1.SandboxOperatingModeHibernated {
 		readyCondition.Reason = "SandboxHibernated"
 		if meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionHibernated)) {
 			readyCondition.Message = "Sandbox is hibernated"
@@ -1787,7 +1813,7 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			logger.Error(err, "Failed to get Pod")
 			return nil, 0, fmt.Errorf("pod get failed: %w", err)
 		}
-		if podNameAnnotationExists && sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeHibernated && sandbox.Status.CheckpointRestore == nil {
+		if podNameAnnotationExists && effectiveOperatingMode(sandbox) != sandboxv1beta1.SandboxOperatingModeHibernated && sandbox.Status.CheckpointRestore == nil {
 			logger.Info("Pod referenced by annotation not found, clearing annotation to recover state", "podName", podName)
 			if err := r.clearPodNameAnnotation(ctx, sandbox); err != nil {
 				return nil, 0, err
@@ -1820,13 +1846,9 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		pod = ownedPods[0].DeepCopy()
 	}
 
-	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated || sandbox.Status.CheckpointRestore != nil ||
-		slices.Contains(sandbox.Finalizers, checkpointRestoreFinalizer) {
-		if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeHibernated {
-			if err := ensureCheckpointRestoreFinalizer(ctx, r.Client, sandbox); err != nil {
-				return pod, 0, fmt.Errorf("ensure checkpoint/restore finalizer: %w", err)
-			}
-		}
+	if sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended &&
+		(effectiveOperatingMode(sandbox) == sandboxv1beta1.SandboxOperatingModeHibernated || sandbox.Status.CheckpointRestore != nil ||
+			slices.Contains(sandbox.Finalizers, checkpointRestoreFinalizer)) {
 		handled, resultPod, err := r.reconcilePodCheckpointRestore(ctx, sandbox, pod)
 		if handled || err != nil {
 			return resultPod, 0, err

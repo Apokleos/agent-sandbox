@@ -57,6 +57,8 @@ func RegisterFlags(fs *flag.FlagSet, c *Config, lookup LookupEnvFunc) {
 		lookup = func(string) (string, bool) { return "", false }
 	}
 	applyEnvDefaults(c, lookup)
+	fs.BoolVar(&c.EnableAutoSuspension, "enable-auto-suspension", c.EnableAutoSuspension,
+		"Enable experimental durable activity admission for opt-in Sandboxes (requires scoped-token authorization).")
 
 	fs.StringVar(&c.HTTPAddr, "http-bind-address", c.HTTPAddr,
 		"Address for the plain-HTTP proxy listener (set empty to disable).")

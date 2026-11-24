@@ -16,19 +16,23 @@ package controllers
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
 func checkpointTestSandbox(mode sandboxv1beta1.SandboxOperatingMode) *sandboxv1beta1.Sandbox {
@@ -109,6 +113,9 @@ func readyCheckpoint(sandbox *sandboxv1beta1.Sandbox, name string) *unstructured
 }
 
 func checkpointTestReconciler(sandbox *sandboxv1beta1.Sandbox, pod *corev1.Pod, dynamicObjects ...runtime.Object) *SandboxReconciler {
+	if sandbox.Status.CheckpointRestore != nil && !slices.Contains(sandbox.Finalizers, checkpointRestoreFinalizer) {
+		sandbox.Finalizers = append(sandbox.Finalizers, checkpointRestoreFinalizer)
+	}
 	objects := []runtime.Object{sandbox}
 	if pod != nil {
 		objects = append(objects, pod)
@@ -133,6 +140,17 @@ func TestCheckpointRestoreCreatesUIDPinnedCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, handled)
 	require.Same(t, pod, resultPod)
+	require.Nil(t, sandbox.Status.CheckpointRestore)
+	persisted := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(ctx, types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}, persisted))
+	require.Contains(t, persisted.Finalizers, checkpointRestoreFinalizer)
+	_, err = r.DynamicClient.Resource(podCheckpointGVR).Namespace(sandbox.Namespace).Get(ctx, checkpointName(checkpointOperationID(sandbox, pod)), metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+
+	handled, resultPod, err = r.reconcilePodCheckpointRestore(ctx, sandbox, pod)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Same(t, pod, resultPod)
 	require.NotNil(t, sandbox.Status.CheckpointRestore)
 
 	checkpoint, err := r.DynamicClient.Resource(podCheckpointGVR).Namespace(sandbox.Namespace).Get(ctx, sandbox.Status.CheckpointRestore.CheckpointName, metav1.GetOptions{})
@@ -153,7 +171,57 @@ func TestCheckpointRestoreReadsFullSourcePodSpec(t *testing.T) {
 	handled, _, err := r.reconcilePodCheckpointRestore(ctx, sandbox, cached)
 	require.NoError(t, err)
 	require.True(t, handled)
+	require.Nil(t, sandbox.Status.CheckpointRestore)
+	handled, _, err = r.reconcilePodCheckpointRestore(ctx, sandbox, cached)
+	require.NoError(t, err)
+	require.True(t, handled)
 	require.Equal(t, source.UID, sandbox.Status.CheckpointRestore.SourcePodUID)
+}
+
+func TestCheckpointRestoreDoesNotFinalizeUnreadySource(t *testing.T) {
+	sandbox := checkpointTestSandbox(sandboxv1beta1.SandboxOperatingModeHibernated)
+	pod := checkpointTestPod(sandbox)
+	pod.Status.Conditions[0].Status = corev1.ConditionFalse
+	r := checkpointTestReconciler(sandbox, pod)
+
+	handled, _, err := r.reconcilePodCheckpointRestore(t.Context(), sandbox, pod)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.NotContains(t, sandbox.Finalizers, checkpointRestoreFinalizer)
+	require.Nil(t, sandbox.Status.CheckpointRestore)
+}
+
+func TestCheckpointRestoreFinalizerOnlyRunningConverges(t *testing.T) {
+	for _, checkpointExists := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without checkpoint", true: "with unused checkpoint"}[checkpointExists], func(t *testing.T) {
+			sandbox := checkpointTestSandbox(sandboxv1beta1.SandboxOperatingModeRunning)
+			pod := checkpointTestPod(sandbox)
+			sandbox.Finalizers = []string{checkpointRestoreFinalizer}
+			var objects []runtime.Object
+			if checkpointExists {
+				operationID := checkpointOperationID(sandbox, pod)
+				sandbox.Status.CheckpointRestore = &sandboxv1beta1.SandboxCheckpointRestoreStatus{
+					CheckpointName: checkpointName(operationID), SourcePodName: pod.Name, SourcePodUID: pod.UID,
+					SourceNodeName: pod.Spec.NodeName, OperationID: operationID,
+				}
+				objects = append(objects, readyCheckpoint(sandbox, checkpointName(operationID)))
+				sandbox.Status.CheckpointRestore = nil
+			}
+			r := checkpointTestReconciler(sandbox, pod, objects...)
+
+			handled, _, err := r.reconcilePodCheckpointRestore(t.Context(), sandbox, pod)
+			require.NoError(t, err)
+			require.True(t, handled)
+			if checkpointExists {
+				handled, _, err = r.reconcilePodCheckpointRestore(t.Context(), sandbox, pod)
+				require.NoError(t, err)
+				require.True(t, handled)
+			}
+			updated := &sandboxv1beta1.Sandbox{}
+			require.NoError(t, r.Get(t.Context(), types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}, updated))
+			require.NotContains(t, updated.Finalizers, checkpointRestoreFinalizer)
+		})
+	}
 }
 
 func TestCheckpointRestoreDeletesSourceOnlyAfterReady(t *testing.T) {
@@ -206,18 +274,54 @@ func TestCheckpointRestoreRejectsColdFallbackWhenDisabled(t *testing.T) {
 	r.EnablePodCheckpointRestore = false
 
 	handled, _, err := r.reconcilePodCheckpointRestore(context.Background(), sandbox, nil)
-	require.ErrorContains(t, err, "disabled")
+	require.NoError(t, err)
 	require.True(t, handled)
+	condition := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionCheckpointRestoreSupported))
+	require.NotNil(t, condition)
+	require.Equal(t, metav1.ConditionFalse, condition.Status)
+	require.Equal(t, "Unsupported", condition.Reason)
+	require.Contains(t, condition.Message, "disabled")
 }
 
-func TestCheckpointRestoreBlocksColdStartWhenStatusIsMissing(t *testing.T) {
+func TestCheckpointRestoreUnsupportedTracksCurrentGeneration(t *testing.T) {
+	sandbox := checkpointTestSandbox(sandboxv1beta1.SandboxOperatingModeHibernated)
+	setCheckpointCondition(sandbox, sandboxv1beta1.SandboxConditionCheckpointRestoreSupported, metav1.ConditionFalse, "Unsupported", "disabled")
+	require.True(t, checkpointRestoreUnsupported(sandbox))
+	sandbox.Generation++
+	require.False(t, checkpointRestoreUnsupported(sandbox))
+}
+
+func TestUnsupportedManualHibernationDoesNotRequeue(t *testing.T) {
+	sandbox := checkpointTestSandbox(sandboxv1beta1.SandboxOperatingModeHibernated)
+	pod := checkpointTestPod(sandbox)
+	r := checkpointTestReconciler(sandbox, pod)
+	r.EnablePodCheckpointRestore = false
+	r.APIReader = r.Client
+	r.Tracer = asmetrics.NewNoOp()
+
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}}
+	_, err := r.Reconcile(t.Context(), request)
+	require.NoError(t, err)
+	result, err := r.Reconcile(t.Context(), request)
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+	updated := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}, updated))
+	require.True(t, checkpointRestoreUnsupported(updated), "conditions=%+v generation=%d", updated.Status.Conditions, updated.Generation)
+	require.NotContains(t, updated.Finalizers, checkpointRestoreFinalizer)
+}
+
+func TestCheckpointRestoreReleasesFinalizerWhenStatusIsMissing(t *testing.T) {
 	sandbox := checkpointTestSandbox(sandboxv1beta1.SandboxOperatingModeRunning)
 	sandbox.Finalizers = []string{checkpointRestoreFinalizer}
 	r := checkpointTestReconciler(sandbox, nil)
 
 	handled, _, err := r.reconcilePodCheckpointRestore(context.Background(), sandbox, nil)
+	require.NoError(t, err)
 	require.True(t, handled)
-	require.ErrorContains(t, err, "state is missing")
+	updated := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, r.Get(t.Context(), types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name}, updated))
+	require.NotContains(t, updated.Finalizers, checkpointRestoreFinalizer)
 }
 
 func TestCheckpointRestorePreservesCheckpointWhileSourceTerminates(t *testing.T) {

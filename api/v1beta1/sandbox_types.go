@@ -363,6 +363,7 @@ type SandboxBlueprint struct {
 // SandboxSpec defines the desired state of Sandbox.
 // volumeClaimTemplates is immutable after creation.
 // +kubebuilder:validation:XValidation:rule="has(self.volumeClaimTemplates) == has(oldSelf.volumeClaimTemplates) && (!has(self.volumeClaimTemplates) || self.volumeClaimTemplates == oldSelf.volumeClaimTemplates)",message="volumeClaimTemplates is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.autoSuspension) || has(oldSelf.autoSuspension)",message="autoSuspension must be enabled when the Sandbox is created; recreate the Sandbox to enable it"
 type SandboxSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
@@ -392,6 +393,62 @@ type SandboxSpec struct {
 	// +kubebuilder:default=Running
 	// +optional
 	OperatingMode SandboxOperatingMode `json:"operatingMode,omitempty"`
+
+	// autoSuspension enables traffic-coordinated Kata hibernation; absent is disabled.
+	// +optional
+	AutoSuspension *SandboxAutoSuspensionSpec `json:"autoSuspension,omitempty"`
+}
+
+// SandboxAutoSuspensionSpec opts a workload into the experimental activity protocol.
+// All work must be routed through the Router or acquire a background activity Lease.
+type SandboxAutoSuspensionSpec struct {
+	// idleTimeoutSeconds is the minimum quiet interval after observed activity.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	IdleTimeoutSeconds int32 `json:"idleTimeoutSeconds"`
+	// maxCycles bounds retained checkpoint attempts for this Sandbox UID.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	// +required
+	MaxCycles int32 `json:"maxCycles"`
+	// activityMode acknowledges that unregistered work cannot inhibit suspension.
+	// +kubebuilder:validation:Enum=RoutedRequestsAndLeases
+	// +required
+	ActivityMode string `json:"activityMode"`
+}
+
+// SandboxManualCheckpointState records whether a manual hibernation must
+// finish before the automatic admission gate can reopen.
+// +kubebuilder:validation:Enum=Requested
+type SandboxManualCheckpointState string
+
+const (
+	// SandboxManualCheckpointRequested indicates an in-progress manual hibernation.
+	SandboxManualCheckpointRequested SandboxManualCheckpointState = "Requested"
+)
+
+// SandboxAutoSuspensionStatus is controller allocated admission and budget state.
+// It is retained when the policy is removed to preserve the per-UID cycle budget.
+type SandboxAutoSuspensionStatus struct {
+	// gate fences activity admission during lifecycle operations.
+	// +kubebuilder:validation:Enum=Open;Draining;Checkpointing;Hibernated;Restoring
+	// +required
+	Gate string `json:"gate"`
+	// epoch changes with each gate transition; permits must revalidate it.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	Epoch int64 `json:"epoch"`
+	// lastActivityTime is controller-observed activity, never a client clock.
+	// +optional
+	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
+	// cycles counts reserved checkpoint attempts, including failed attempts.
+	// +kubebuilder:validation:Minimum=0
+	// +required
+	Cycles int32 `json:"cycles"`
+
+	// manualCheckpoint keeps manual Running reversal closed until capture finishes.
+	// +optional
+	ManualCheckpoint SandboxManualCheckpointState `json:"manualCheckpoint,omitempty"`
 }
 
 // SandboxCheckpointRestoreStatus records the durable identity of the current
@@ -514,6 +571,10 @@ type SandboxStatus struct {
 	// Workflow progress is represented by status conditions.
 	// +optional
 	CheckpointRestore *SandboxCheckpointRestoreStatus `json:"checkpointRestore,omitempty"`
+
+	// autoSuspension persists admission fencing and retained checkpoint budget.
+	// +optional
+	AutoSuspension *SandboxAutoSuspensionStatus `json:"autoSuspension,omitempty"`
 }
 
 // +genclient

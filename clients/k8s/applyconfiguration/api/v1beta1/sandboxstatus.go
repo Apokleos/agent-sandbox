@@ -49,6 +49,8 @@ type SandboxStatusApplyConfiguration struct {
 	// checkpointRestore records durable Pod checkpoint/restore cycle identity.
 	// Workflow progress is represented by status conditions.
 	CheckpointRestore *SandboxCheckpointRestoreStatusApplyConfiguration `json:"checkpointRestore,omitempty"`
+	// autoSuspension persists admission fencing and retained checkpoint budget.
+	AutoSuspension *SandboxAutoSuspensionStatusApplyConfiguration `json:"autoSuspension,omitempty"`
 }
 
 // SandboxStatusApplyConfiguration constructs a declarative configuration of the SandboxStatus type for use with
@@ -117,5 +119,13 @@ func (b *SandboxStatusApplyConfiguration) WithNodeName(value string) *SandboxSta
 // If called multiple times, the CheckpointRestore field is set to the value of the last call.
 func (b *SandboxStatusApplyConfiguration) WithCheckpointRestore(value *SandboxCheckpointRestoreStatusApplyConfiguration) *SandboxStatusApplyConfiguration {
 	b.CheckpointRestore = value
+	return b
+}
+
+// WithAutoSuspension sets the AutoSuspension field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the AutoSuspension field is set to the value of the last call.
+func (b *SandboxStatusApplyConfiguration) WithAutoSuspension(value *SandboxAutoSuspensionStatusApplyConfiguration) *SandboxStatusApplyConfiguration {
+	b.AutoSuspension = value
 	return b
 }
