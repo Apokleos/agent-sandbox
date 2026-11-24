@@ -49,6 +49,7 @@ spec:
                 enum:
                 - Running
                 - Suspended
+                - Hibernated
                 type: string
               podTemplate:
                 properties:
@@ -4108,6 +4109,32 @@ spec:
                 oldSelf.volumeClaimTemplates)
           status:
             properties:
+              checkpointRestore:
+                properties:
+                  checkpointName:
+                    type: string
+                  checkpointUID:
+                    type: string
+                  operationID:
+                    type: string
+                  restoreGeneration:
+                    format: int64
+                    type: integer
+                  restoreStartTime:
+                    format: date-time
+                    type: string
+                  restoredPodUID:
+                    type: string
+                  sourceNodeName:
+                    type: string
+                  sourcePodName:
+                    type: string
+                  sourcePodUID:
+                    type: string
+                  startedAt:
+                    format: date-time
+                    type: string
+                type: object
               conditions:
                 items:
                   properties:

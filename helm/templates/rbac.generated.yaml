@@ -48,6 +48,18 @@ rules:
   - patch
   - update
 - apiGroups:
+  - checkpoint.k8s.io
+  resources:
+  - podcheckpoints
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - restore
+  - watch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases

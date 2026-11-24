@@ -34,6 +34,7 @@ import (
 
 	"github.com/felixge/fgprof"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/events"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/controllers"
@@ -93,6 +94,8 @@ func main() {
 	var metricsCertDir string
 	var tlsMinVersion string
 	var tlsCipherSuites string
+	var enablePodCheckpointRestore bool
+	var podCheckpointRuntimeClasses string
 
 	flag.BoolVar(&printVersion, "version", false, "Print version information and exit.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Kubernetes cluster domain for service FQDN generation")
@@ -190,6 +193,10 @@ func main() {
 			"using Go cipher-suite names (e.g. TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). "+
 			"If not set, the Go default applies. TLS 1.3 cipher suites are not configurable. "+
 			"A downstream operator can use this flag to inject the cluster TLS profile.")
+	flag.BoolVar(&enablePodCheckpointRestore, "enable-pod-checkpoint-restore", false,
+		"Enable the alpha Sandbox Hibernated mode backed by the checkpoint.k8s.io PodCheckpoint API.")
+	flag.StringVar(&podCheckpointRuntimeClasses, "pod-checkpoint-runtime-classes", "kata-pod-ckpt",
+		"Comma-separated RuntimeClass names allowed to use Sandbox Pod checkpoint/restore.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -478,6 +485,17 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create dynamic Kubernetes client")
+		os.Exit(1)
+	}
+	checkpointRuntimeClasses := make(map[string]struct{})
+	for item := range strings.SplitSeq(podCheckpointRuntimeClasses, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			checkpointRuntimeClasses[item] = struct{}{}
+		}
+	}
 
 	// Register the custom Sandbox metric collector globally.
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
@@ -501,13 +519,16 @@ func main() {
 	}
 
 	if err = (&controllers.SandboxReconciler{
-		Client:            mgr.GetClient(),
-		APIReader:         mgr.GetAPIReader(),
-		Scheme:            mgr.GetScheme(),
-		Recorder:          sandboxRecorder,
-		Tracer:            instrumenter,
-		ClusterDomain:     clusterDomain,
-		WriteBehindWindow: sandboxWriteBehindWindow,
+		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
+		Recorder:                    sandboxRecorder,
+		Scheme:                      mgr.GetScheme(),
+		Tracer:                      instrumenter,
+		ClusterDomain:               clusterDomain,
+		DynamicClient:               dynamicClient,
+		EnablePodCheckpointRestore:  enablePodCheckpointRestore,
+		PodCheckpointRuntimeClasses: checkpointRuntimeClasses,
+		WriteBehindWindow:           sandboxWriteBehindWindow,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
